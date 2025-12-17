@@ -1,0 +1,309 @@
+#include "mbed.h"
+using namespace std::chrono;
+// IO DEFINITIONS 
+
+// conveyor / nozzle LEDs on D10–D13
+DigitalOut conveyorRed   (D10);   // conveyor red LED
+DigitalOut conveyorGreen (D11);   // conveyor green LED
+DigitalOut nozzleRed     (D12);   // nozzle red LED
+DigitalOut nozzleGreen   (D13);   // nozzle green LED
+
+// on board buttons
+DigitalIn startBUTTON (SW1, PullUp);  
+DigitalIn stopBUTTON  (SW3, PullUp);
+
+// DIP switch bits for BOXES
+DigitalIn dipBOX0   (D2, PullUp);
+DigitalIn dipBOX1   (D3, PullUp);
+DigitalIn dipBOX2   (D4, PullUp);
+DigitalIn dipBOX3   (D5, PullUp);
+
+// DIP switch bits for PIECES
+DigitalIn dipPIECE0 (D6, PullUp);
+DigitalIn dipPIECE1 (D7, PullUp);
+DigitalIn dipPIECE2 (D8, PullUp);
+DigitalIn dipPIECE3 (D9, PullUp);
+
+// TIMING CONSTANTS
+
+#define MOVE_TIME_MS   5000   // 5 s per box movement
+#define PIECE_TIME_MS  1000   // 1 s per piece
+#define TICK_MS         100   // step to check STOP
+
+// STATE MACHINE
+
+enum State {
+    state_idle,
+    state_moving_box,
+    state_dispensing_pieces,
+    state_complete,
+    state_EMERGENCY_STOP
+};
+
+State current_state = state_idle;
+// global config + counters
+int totalboxes   = 0;
+int piecesperbox = 0;
+int currentbox   = 0;  
+int currentpiece = 0;  
+
+// START button
+bool start_pressed() {
+    return (startBUTTON.read() == 0);   // active LOW
+}
+
+// debounced stop button 
+bool stop_pressed() {
+    int lowCount       = 0;
+    const int stopReads = 5;
+
+    for (int i = 0; i < stopReads; i++) {
+        if (stopBUTTON.read() == 0) {   // active LOW
+            lowCount++;
+        }
+        ThisThread::sleep_for(2ms);
+    }
+
+    return (lowCount >= 4);
+}
+
+// turns conveyor LEDs on and off
+void set_conveyor(bool moving) {
+    if (moving) {
+        conveyorGreen = 1;
+        conveyorRed   = 0;
+    } else {
+        conveyorGreen = 0;
+        conveyorRed   = 1;
+    }
+}
+
+// turns nozzle LEDs on and off
+void set_nozzle(bool open) {
+    if (open) {
+        nozzleGreen = 1;
+        nozzleRed   = 0;
+    } else {
+        nozzleGreen = 0;
+        nozzleRed   = 1;
+    }
+}
+
+// delay with STOP checking
+bool delay_with_stop_check(int total_ms) {
+    int elapsed = 0;
+    while (elapsed < total_ms) {
+        if (stop_pressed()) {
+            return false;   // interrupted
+        }
+        ThisThread::sleep_for(milliseconds(TICK_MS));
+        elapsed += TICK_MS;
+    }
+    return true;
+}
+
+// DIP SWITCH READING
+
+// read a 4-bit active LOW DIP group: b0 = LSB, b3 = MSB
+int read_4bit_active_low(DigitalIn &b0, DigitalIn &b1,
+                         DigitalIn &b2, DigitalIn &b3) {
+    int value = 0;
+
+    value |= (!b0.read()) << 0; 
+    value |= (!b1.read()) << 1;
+    value |= (!b2.read()) << 2;
+    value |= (!b3.read()) << 3;
+
+    return value;               
+}
+
+// read the number of boxes + pieces per box from the DIP switches
+void read_configuration_from_dip() {
+    int boxes  = read_4bit_active_low(dipBOX0,   dipBOX1,   dipBOX2,   dipBOX3);
+    int pieces = read_4bit_active_low(dipPIECE0, dipPIECE1, dipPIECE2, dipPIECE3);
+
+    // avoid 0 values
+    if (boxes == 0)  {
+        boxes = 1;
+    }
+    if (pieces == 0) {
+        pieces = 1;
+    }
+// avoids 0 boxes or pieces to adhere  to 1 15 rule
+    totalboxes   = boxes;
+    piecesperbox = pieces;
+
+    printf("DIP configuration boxes = %d, pieces = %d\r\n",
+           totalboxes, piecesperbox);
+}
+
+// STATE FUNCTIONS
+
+void idle_state() {
+    set_conveyor(false);
+    set_nozzle(false);
+
+    printf("\r\n IDLE STATE \r\n");
+    printf("Set DIP switches, then press START.\r\n");
+
+    read_configuration_from_dip();
+    currentbox = 0;
+
+    // wait for START or STOP
+    while (true) {
+        if (stop_pressed()) {
+            current_state = state_EMERGENCY_STOP;
+            return;
+        }
+
+        if (start_pressed()) {
+            // reread in case user changed DIP switches
+            read_configuration_from_dip();
+            currentbox = 0;
+            current_state = state_moving_box;
+            return;
+        }
+
+        ThisThread::sleep_for(50ms);
+    }
+}
+
+void moving_box_state() {
+    printf("\r\nMOVING BOX %d of %d\r\n",
+           currentbox + 1, totalboxes);
+
+    // safety: nozzle closed, conveyor moving
+    set_nozzle(false);
+    set_conveyor(true);
+
+    bool finished = delay_with_stop_check(MOVE_TIME_MS);
+
+    if (!finished) {
+        printf("EMERGENCY STOP\r\n");
+        current_state = state_EMERGENCY_STOP;
+        return;
+    }
+
+    set_conveyor(false);
+    currentpiece  = 0;
+    current_state = state_dispensing_pieces;
+}
+
+void dispensing_pieces_state() {
+    printf("\r\nDISPENSING %d PIECES IN BOX %d\r\n", piecesperbox, currentbox + 1);
+
+    set_conveyor(false);
+    set_nozzle(true);
+
+    for (currentpiece = 0; currentpiece < piecesperbox; currentpiece++) {
+        printf("  piece %d of %d in box %d\r\n",
+               currentpiece + 1, piecesperbox, currentbox + 1);
+
+        if (!delay_with_stop_check(PIECE_TIME_MS)) {
+            printf("  EMERGENCY STOP AT PIECE %d \r\n",currentpiece + 1);
+            current_state = state_EMERGENCY_STOP;
+            return;
+        }
+    }
+
+    printf("  all %d pieces dispensed in box %d\r\n",
+           piecesperbox, currentbox + 1);
+
+    set_nozzle(false);      // closes nozzle when finished
+
+    currentbox++;
+    if (currentbox >= totalboxes) {
+        current_state = state_complete;
+    } else {
+        current_state = state_moving_box;
+    }
+}
+
+void complete_state() {
+    printf("\r\n COMPLETE \r\n");
+    printf("All %d boxes finished.\r\n", totalboxes);
+    printf("Press START to return to IDLE.\r\n");
+
+    set_conveyor(false);
+    set_nozzle(false);
+
+    while (true) {
+        if (stop_pressed()) {
+            current_state = state_EMERGENCY_STOP;
+            return;
+        }
+
+        if (start_pressed()) {
+            // wait for START to be released so IDLE
+            // doesn't instantly see it as pressed
+            while (start_pressed()) {
+                ThisThread::sleep_for(50ms);
+            }
+            current_state = state_idle;
+            return;
+        }
+
+        ThisThread::sleep_for(50ms);
+    }
+}
+
+void emergency_stop_state() {
+    printf("\r\n EMERGENCY STOP \r\n");
+    printf("press START to return to IDLE.\r\n");
+
+    set_conveyor(false);
+    set_nozzle(false);
+
+    // wait while STOP is held
+    while (stopBUTTON.read() == 0) {
+        ThisThread::sleep_for(50ms);
+    }
+
+    // wait for START press
+    while (!start_pressed()) {
+        ThisThread::sleep_for(50ms);
+    }
+
+    // wait for START release
+    while (start_pressed()) {
+        ThisThread::sleep_for(50ms);
+    }
+
+    current_state = state_idle;
+}
+
+
+
+// MAIN
+
+int main() {
+    // initial safe outputs
+    set_conveyor(false);
+    set_nozzle(false);
+
+    printf("Conveyor system starting\r\n");
+
+    while (true) {
+        switch (current_state) {
+            case state_idle:
+                idle_state();
+                break;
+
+            case state_moving_box:
+                moving_box_state();
+                break;
+
+            case state_dispensing_pieces:
+                dispensing_pieces_state();
+                break;
+
+            case state_complete:
+                complete_state();
+                break;
+
+            case state_EMERGENCY_STOP:
+                emergency_stop_state();
+                break;
+        }
+    }
+}
